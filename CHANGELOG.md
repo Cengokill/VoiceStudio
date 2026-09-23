@@ -8,6 +8,14 @@ metadata and the backend fallback mirror it. Archived Tauri manifests stay froze
 
 ## [Unreleased]
 
+**Highlights**
+
+- Long voice references clone with the speech model you already installed (#2281)
+
+### Fixed
+
+- A reference longer than 20 s is transcribed with the speech-to-text model already installed, instead of failing when OmniVoice's own Whisper snapshot is not cached (#2281) — thanks @Cengokill!
+
 ## [0.5.6] — 2026-09-23
 
 **VoiceStudio now talks to your other tools.** Answer Twilio phone calls in a saved voice, and connect Claude Code, Cursor, Codex CLI and the OpenAI Agents SDK to VoiceStudio with copyable setup that works, including in Docker, where MCP previously returned HTTP 405. Integration cards now say plainly which ones work with VoiceStudio and which are external links.
@@ -57,7 +65,6 @@ This release also lets you replace a saved clone's reference sample, clones long
 
 - Pasted and imported captions no longer speak karaoke tags, `<i>`/`<font>` tags or `{\an8}` alignment prefixes, while SubRip dialogue such as `2 < 3` is kept; unchanged WebVTT and SubRip exports keep the original cue markup (#2295) — thanks @kevin9327!
 - Saved voices and uploads longer than 20 s clone on OmniVoice again; the best passage is picked automatically (#2281) — thanks @Cengokill!
-- A reference longer than 20 s is transcribed with the speech-to-text model already installed, instead of failing when OmniVoice's own Whisper snapshot is not cached (#2281) — thanks @Cengokill!
 - VoxCPM2 no longer pairs a capped reference with a transcript of the whole clip (#2281)
 - Speaker diarisation uses Lightning 2.6.6, which blocks code execution from a crafted checkpoint (#2296)
 - Long audiobook chapters on 8 GB GPUs no longer time out while still rendering, and a timed-out chapter stops using the GPU after its current chunk (#2287) — thanks @Tran-Van-Hieu!
