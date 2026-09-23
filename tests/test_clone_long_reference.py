@@ -10,9 +10,12 @@ own transcript-free path picks the best 15 s passage of clips up to 75 s.
 
 Rules pinned here:
   * an automatic or stored transcript on an over-long clip is dropped at the
-    engine boundary (in-process prompt cache, inline fallback, sidecar), so the
-    model's best-passage selection runs;
-  * no whole-clip ASR is spent on such a clip;
+    engine boundary (in-process prompt cache, inline fallback, sidecar);
+  * the installed catalogue recognizer transcribes each 15 s window and the
+    window with the most speech is what gets encoded — the model's Whisper
+    snapshot is not required for that;
+  * no whole-clip ASR is spent on such a clip; if the catalogue recognizer
+    returns nothing, the model's own passage selection still runs;
   * a transcript typed on the request still gets the actionable error;
   * engines advertise how much of a reference they use (``list_backends``).
 """
@@ -72,36 +75,79 @@ def no_prompt_disk_cache(monkeypatch):
 class _CountingTranscribe:
     def __init__(self, result="whole clip transcript"):
         self.calls = 0
+        self.paths = []
         self.result = result
 
-    def __call__(self, _path):
+    def __call__(self, path):
         self.calls += 1
+        self.paths.append(path)
         return self.result
 
 
-def test_auto_transcribed_long_reference_uses_best_passage(
+def test_long_reference_uses_installed_asr_windows(
     tmp_path, monkeypatch, no_prompt_disk_cache
 ):
-    """Before the fix: whole-clip ASR → [clone_ref_too_long] → prompt None, and
-    the inline fallback raised the same error. Now no ASR and a 15 s passage."""
+    """A 25 s clip is ranked by the catalogue recognizer, not model Whisper."""
+    import services.asr_backend as ab
+    from omnivoice.models.omnivoice import OmniVoice
+
+    class _Windows:
+        def __init__(self):
+            self.paths = []
+
+        def __call__(self, path):
+            self.paths.append(path)
+            if len(self.paths) == 1:
+                return "hi"
+            return "this window has many spoken words"
+
+    windows = _Windows()
+    monkeypatch.setattr(ab, "transcribe_reference", windows)
+    monkeypatch.setattr(
+        OmniVoice,
+        "_load_cached_reference_asr",
+        lambda self: (_ for _ in ()).throw(AssertionError("model whisper")),
+    )
+    model = _omnivoice_stub()
+    model._asr_pipe = None
+    original = _wav(tmp_path / "long.wav", 25)
+
+    prompt = _tts()._get_clone_prompt(model, original, None)
+
+    assert prompt is not None
+    assert prompt.ref_text.startswith("this window has many spoken words")
+    assert model.audio_tokenizer.seen_samples <= 15 * SR
+    assert original not in windows.paths
+    assert len(windows.paths) == 2
+
+
+def test_long_reference_without_installed_asr_uses_model_passage(
+    tmp_path, monkeypatch, no_prompt_disk_cache
+):
+    """No catalogue transcript: the model's own best-passage path still runs."""
     import services.asr_backend as ab
 
-    counting = _CountingTranscribe()
+    counting = _CountingTranscribe(result=None)
     monkeypatch.setattr(ab, "transcribe_reference", counting)
     model = _omnivoice_stub()
+    original = _wav(tmp_path / "long.wav", 25)
 
-    prompt = _tts()._get_clone_prompt(model, _wav(tmp_path / "long.wav", 25), None)
+    prompt = _tts()._get_clone_prompt(model, original, None)
 
     assert prompt is not None
     assert prompt.ref_text.startswith("Selected passage words")
     assert model.audio_tokenizer.seen_samples <= 15 * SR
-    assert counting.calls == 0
+    assert original not in counting.paths
+    assert counting.calls == 2
 
 
 def test_stored_whole_clip_transcript_on_long_reference_still_clones(
-    tmp_path, no_prompt_disk_cache
+    tmp_path, monkeypatch, no_prompt_disk_cache
 ):
     """Existing saved profiles carry the save-time whole-clip transcript."""
+    import services.asr_backend as ab
+
+    monkeypatch.setattr(ab, "transcribe_reference", lambda _path: None)
     model = _omnivoice_stub()
 
     prompt = _tts()._get_clone_prompt(
@@ -146,6 +192,7 @@ def test_inline_fallback_drops_whole_clip_transcript(tmp_path, monkeypatch):
 def test_sidecar_request_drops_whole_clip_transcript(tmp_path, monkeypatch):
     from engines.omnivoice_subprocess import OmniVoiceSubprocessBackend
 
+    monkeypatch.setattr(_tts(), "_omnivoice_installed_passage", lambda _path: None)
     seen = {}
     # The class's own base, not a fresh import: other suites purge
     # sys.modules["services"], leaving a second SubprocessBackend object.
@@ -159,6 +206,32 @@ def test_sidecar_request_drops_whole_clip_transcript(tmp_path, monkeypatch):
     assert seen["ref_text"] is None
     backend.generate("hi", ref_audio=short_path, ref_text="short clip")
     assert seen["ref_text"] == "short clip"
+
+
+def test_sidecar_forwards_installed_passage(tmp_path, monkeypatch):
+    import shutil
+
+    from engines.omnivoice_subprocess import OmniVoiceSubprocessBackend
+
+    window = _wav(tmp_path / "window.wav", 10)
+
+    def _selected(_path):
+        owned = tmp_path / "owned.wav"
+        shutil.copy(window, owned)
+        return str(owned), "best passage words"
+
+    monkeypatch.setattr(_tts(), "_omnivoice_installed_passage", _selected)
+    seen = {}
+    base = OmniVoiceSubprocessBackend.__mro__[1]
+    monkeypatch.setattr(base, "generate", lambda self, text, **kw: seen.update(kw))
+    backend = OmniVoiceSubprocessBackend.__new__(OmniVoiceSubprocessBackend)
+    long_path = _wav(tmp_path / "long.wav", 25)
+
+    backend.generate("hi", ref_audio=long_path, ref_text="whole clip")
+
+    assert seen["ref_text"] == "best passage words"
+    assert seen["ref_audio"] != long_path
+    assert not os.path.exists(seen["ref_audio"])
 
 
 def test_model_limit_matches_advertised_engine_limit():

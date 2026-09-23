@@ -66,9 +66,12 @@ The env var overrides the persisted UI choice.
   to 20 seconds so the two stay aligned; trim both to the same passage. Without
   a transcript, VoiceStudio can search up to 75 seconds in five contiguous,
   bounded transcription passes and selects the 15-second passage with the most
-  detected speech. For a clip longer than 20 seconds, VoiceStudio skips
+  detected speech. Those passes use the speech-to-text model already installed
+  in Model Catalogue. For a clip longer than 20 seconds, VoiceStudio skips
   whole-clip transcription and ignores a saved profile transcript, so long
-  saved voices use this selection too. A transcript typed on the request for
+  saved voices use this selection too. OmniVoice's own Whisper snapshot is only
+  a fallback when no catalogue recognizer can transcribe a window, and it is
+  never downloaded during cloning. A transcript typed on the request for
   such a clip is rejected with `[clone_ref_too_long]`.
   Longer clips must be trimmed first. If no spoken words are detected, trim to
   a clear 3–10 second passage or provide its matching transcript.

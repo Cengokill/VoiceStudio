@@ -816,6 +816,88 @@ def omnivoice_ref_text(ref_audio, ref_text):
     return None
 
 
+def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
+    """Pick a long clip's best 15 s window with the installed recognizer.
+
+    OmniVoice cannot align a transcript to more than 20 s, so a longer clip
+    is cloned from one 15 s window. The model's own Whisper snapshot is a
+    last resort and is never downloaded; this uses the speech-to-text model
+    already selected in Model Catalogue (#2281). Returns ``(wav_path,
+    transcript)`` or None when no installed recognizer produced words. The
+    caller deletes ``wav_path``.
+    """
+    from omnivoice.utils.audio import CLONE_REF_MAX_WINDOWS, CLONE_REF_WINDOW_SECONDS
+
+    try:
+        import soundfile as sf
+
+        info = sf.info(ref_audio)
+        sr = int(info.samplerate)
+        window = int(CLONE_REF_WINDOW_SECONDS * sr)
+        if window <= 0 or info.frames <= window:
+            return None
+        if info.frames > window * CLONE_REF_MAX_WINDOWS:
+            return None
+        audio, sr = sf.read(ref_audio, dtype="float32", always_2d=False)
+    except Exception:
+        logger.debug("long-reference passage split failed", exc_info=True)
+        return None
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    try:
+        from services.asr_backend import transcribe_reference
+    except Exception:
+        logger.debug("installed reference ASR import failed", exc_info=True)
+        return None
+
+    import tempfile
+
+    best_score = -1
+    best_activity = -1.0
+    best_path: Optional[str] = None
+    best_text = ""
+    n_windows = min(CLONE_REF_MAX_WINDOWS, (len(audio) + window - 1) // window)
+    for index in range(n_windows):
+        chunk = audio[index * window:(index + 1) * window]
+        if len(chunk) == 0:
+            continue
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            sf.write(path, chunk, sr)
+            text = (transcribe_reference(path) or "").strip()
+        except Exception:
+            logger.warning("window transcription failed", exc_info=True)
+            text = ""
+        score = _speech_score(text)
+        activity = float((chunk.astype("float64") ** 2).sum()) if score else 0.0
+        if score > 0 and (
+            score > best_score or (score == best_score and activity > best_activity)
+        ):
+            if best_path is not None:
+                try:
+                    os.remove(best_path)
+                except OSError:
+                    pass
+            best_score = score
+            best_activity = activity
+            best_path = path
+            best_text = text
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if best_path is None:
+        return None
+    return best_path, best_text
+
+
+def _speech_score(text: str) -> int:
+    """Spoken-character count, matching OmniVoice's window ranking."""
+    return len(re.sub(r"[^\w]+", "", text or "", flags=re.UNICODE))
+
+
 def _get_clone_prompt(
     model, ref_audio: str, ref_text, preprocess_prompt: bool = True, *,
     store: bool = True,
@@ -878,62 +960,84 @@ def _get_clone_prompt(
     # Memory miss → disk (survives restarts). A disk hit skips the encode AND
     # the ASR transcription pass a ref_text-less reference would trigger.
     prompt = _prompt_disk_load(key)
-    if prompt is None:
-        try:
-            # Encode outside the lock (slow). Mirrors exactly what generate()
-            # would do inline for this ref (omnivoice.py:964-978), so output is
-            # identical.
-            prompt = model.create_voice_clone_prompt(
-                ref_audio, ref_text=ref_text, preprocess_prompt=preprocess_prompt
-            )
-        except Exception as e:  # noqa: BLE001 — fall back, never break synthesis
-            # #1790/#1777: a GPU OOM is the one failure this fallback cannot
-            # absorb. `generate()`'s inline ref path runs the SAME encode on the
-            # SAME device — the docstring above says so, because producing
-            # identical output is the point — so returning None after an OOM
-            # guarantees a second OOM moments later, on a device with even less
-            # headroom than the first attempt found. Both reporters' backends
-            # then died with a Windows access violation (exit code
-            # -1073741819) seconds after this exact log line, mid-generation on
-            # a GPU that had just refused an 86 MiB allocation.
-            #
-            # An OOM here is also the most recoverable kind: the allocator is
-            # typically holding reserved-but-unallocated blocks (#1790's own
-            # log reports 90 MiB reserved against an 86 MiB request). Drop them
-            # and try once more. If it still will not fit, raise — the failure
-            # layer turns a device OOM into the actionable GPU_OOM message
-            # ("close other GPU-heavy apps or unload models…"), which is a far
-            # better answer than walking into a native fault.
-            from core.failure import is_gpu_oom
-
-            if is_gpu_oom(e):
-                logger.warning(
-                    "voice-clone prompt precompute hit a device OOM (%s) — "
-                    "releasing allocator caches and retrying once", e,
-                )
-                try:
-                    from services.model_manager import free_vram
-                    free_vram()
-                except Exception:  # noqa: BLE001 — reclaim is best-effort
-                    logger.debug("VRAM reclaim before OOM retry failed", exc_info=True)
+    encode_audio = ref_audio
+    encode_text = ref_text
+    passage_file = None
+    if (
+        prompt is None
+        and duration is not None
+        and duration > CLONE_REF_TEXT_MAX_SECONDS
+    ):
+        # Rank 15 s windows with the installed recognizer and encode only the
+        # winner, so a missing OmniVoice Whisper snapshot cannot block a clip
+        # the catalogue can already transcribe.
+        selected = _omnivoice_installed_passage(ref_audio)
+        if selected is not None:
+            passage_file, encode_text = selected
+            encode_audio = passage_file
+    try:
+        if prompt is None:
+            try:
+                # Encode outside the lock (slow). Mirrors exactly what generate()
+                # would do inline for this ref (omnivoice.py:964-978), so output is
+                # identical.
                 prompt = model.create_voice_clone_prompt(
-                    ref_audio, ref_text=ref_text, preprocess_prompt=preprocess_prompt
+                    encode_audio, ref_text=encode_text, preprocess_prompt=preprocess_prompt
                 )
-            else:
-                logger.warning(
-                    "voice-clone prompt precompute failed; using inline ref: %s", e
-                )
-                return None
-        if store:
-            _prompt_disk_save(key, prompt)
-    if not store:
+            except Exception as e:  # noqa: BLE001 — fall back, never break synthesis
+                # #1790/#1777: a GPU OOM is the one failure this fallback cannot
+                # absorb. `generate()`'s inline ref path runs the SAME encode on the
+                # SAME device — the docstring above says so, because producing
+                # identical output is the point — so returning None after an OOM
+                # guarantees a second OOM moments later, on a device with even less
+                # headroom than the first attempt found. Both reporters' backends
+                # then died with a Windows access violation (exit code
+                # -1073741819) seconds after this exact log line, mid-generation on
+                # a GPU that had just refused an 86 MiB allocation.
+                #
+                # An OOM here is also the most recoverable kind: the allocator is
+                # typically holding reserved-but-unallocated blocks (#1790's own
+                # log reports 90 MiB reserved against an 86 MiB request). Drop them
+                # and try once more. If it still will not fit, raise — the failure
+                # layer turns a device OOM into the actionable GPU_OOM message
+                # ("close other GPU-heavy apps or unload models…"), which is a far
+                # better answer than walking into a native fault.
+                from core.failure import is_gpu_oom
+
+                if is_gpu_oom(e):
+                    logger.warning(
+                        "voice-clone prompt precompute hit a device OOM (%s) — "
+                        "releasing allocator caches and retrying once", e,
+                    )
+                    try:
+                        from services.model_manager import free_vram
+                        free_vram()
+                    except Exception:  # noqa: BLE001 — reclaim is best-effort
+                        logger.debug("VRAM reclaim before OOM retry failed", exc_info=True)
+                    prompt = model.create_voice_clone_prompt(
+                        encode_audio, ref_text=encode_text, preprocess_prompt=preprocess_prompt
+                    )
+                else:
+                    logger.warning(
+                        "voice-clone prompt precompute failed; using inline ref: %s", e
+                    )
+                    return None
+            if store:
+                _prompt_disk_save(key, prompt)
+        if not store:
+            return prompt
+        with _prompt_cache_lock:
+            _prompt_cache[key] = prompt
+            _prompt_cache.move_to_end(key)
+            while len(_prompt_cache) > _PROMPT_CACHE_MAX:
+                _prompt_cache.popitem(last=False)
         return prompt
-    with _prompt_cache_lock:
-        _prompt_cache[key] = prompt
-        _prompt_cache.move_to_end(key)
-        while len(_prompt_cache) > _PROMPT_CACHE_MAX:
-            _prompt_cache.popitem(last=False)
-    return prompt
+    finally:
+        if passage_file is not None:
+            try:
+                os.remove(passage_file)
+            except OSError:
+                logger.debug("failed to remove reference window %s", passage_file)
 
 
 def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
