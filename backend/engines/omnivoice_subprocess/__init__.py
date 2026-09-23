@@ -70,14 +70,14 @@ class OmniVoiceSubprocessBackend(SubprocessBackend):
         if isinstance(audio, str):
             from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
             from services.tts_backend import (
-                _omnivoice_installed_passage,
+                _reuse_or_rank_passage,
                 omnivoice_ref_text,
                 reference_duration_s,
             )
 
             duration = reference_duration_s(audio)
             if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
-                selected = _omnivoice_installed_passage(audio)
+                selected = _reuse_or_rank_passage(audio)
                 if selected is not None:
                     kw["ref_audio"], kw["ref_text"] = selected
                     passage = selected[0]

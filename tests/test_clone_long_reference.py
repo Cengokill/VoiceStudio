@@ -20,6 +20,7 @@ Rules pinned here:
   * engines advertise how much of a reference they use (``list_backends``).
 """
 import importlib
+import logging
 import os
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -521,10 +522,13 @@ def long_profile():
     os.remove(clip)
 
 
-def test_passage_choices_share_the_prompt_cache_lock(tmp_path, no_prompt_disk_cache):
+def test_passage_choices_share_the_prompt_cache_lock(
+    tmp_path, monkeypatch, no_prompt_disk_cache,
+):
     """Two GPU workers can rank long references at once; the window LRU must
     take the same lock as the prompt cache."""
     tts = _tts()
+    monkeypatch.setattr(tts, "_reference_asr_identity", lambda: "lock-test")
     held = []
 
     class _Guarded(OrderedDict):
@@ -564,6 +568,140 @@ def test_passage_choices_share_the_prompt_cache_lock(tmp_path, no_prompt_disk_ca
     finally:
         tts._passage_choices = original
     assert held and all(held)
+
+
+def test_unnamed_recognizer_is_not_cached(tmp_path, monkeypatch, no_prompt_disk_cache):
+    """An identity we cannot name must not become a shared cache key."""
+    tts = _tts()
+    monkeypatch.setattr(tts, "_reference_asr_identity", lambda: "")
+
+    tts._remember_passage(_wav(tmp_path / "clip.wav", 1), 1, "words")
+
+    assert list(tts._passage_choices) == []
+
+
+def test_passage_identity_tracks_each_selected_model(monkeypatch):
+    """WhisperX, and every other backend, changes the key when its model changes."""
+    import services.asr_backend as ab
+
+    tts = _tts()
+    monkeypatch.setattr(ab, "active_backend_id", lambda: "whisperx")
+    monkeypatch.setattr(ab, "asr_model_missing_error", lambda **_kwargs: None)
+    monkeypatch.setattr(tts, "_capture_recognizer_label", lambda _ab: "faster-whisper:fixed")
+    monkeypatch.setattr(tts, "_fallback_recognizer_labels", lambda _ab, _parts: [])
+    monkeypatch.setenv("ASR_MODEL_WHISPERX", "small")
+
+    small = tts._reference_asr_identity()
+    monkeypatch.setenv("ASR_MODEL_WHISPERX", "large-v3")
+    large = tts._reference_asr_identity()
+
+    assert small == "whisperx:small|faster-whisper:fixed"
+    assert large == "whisperx:large-v3|faster-whisper:fixed"
+
+
+def test_silent_long_reference_is_not_ranked_again(
+    tmp_path, monkeypatch, no_prompt_disk_cache,
+):
+    """No spoken words is a stable result: the next chunk must not re-run ASR."""
+    import services.asr_backend as ab
+
+    counting = _CountingTranscribe(result=None)
+    monkeypatch.setattr(ab, "transcribe_reference", counting)
+    monkeypatch.setattr(_tts(), "_reference_asr_identity", lambda: "fixed-recognizer")
+    model = _omnivoice_stub()
+    original = _wav(tmp_path / "silent.wav", 25)
+
+    _tts()._get_clone_prompt(model, original, None)
+    _tts()._get_clone_prompt(model, original, None)
+
+    assert counting.calls == 2
+
+
+def test_long_reference_decodes_when_soundfile_cannot(
+    tmp_path, monkeypatch, no_prompt_disk_cache,
+):
+    """AAC/M4A fall through libsndfile to ffmpeg, then still rank 15 s windows."""
+    import soundfile as sf
+    import services.asr_backend as ab
+    from pydub import AudioSegment
+
+    class _Segment:
+        frame_rate = SR
+        channels = 1
+        sample_width = 2
+
+        def get_array_of_samples(self):
+            return [1000] * (25 * SR)
+
+    real_read = sf.read
+
+    def _read(path, *args, **kwargs):
+        if os.path.basename(str(path)) == "long.wav":
+            raise RuntimeError("unsupported")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(sf, "read", _read)
+    monkeypatch.setattr(AudioSegment, "from_file", lambda _path: _Segment())
+
+    class _Windows:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _path):
+            self.calls += 1
+            if self.calls == 1:
+                return "hi"
+            return "this window has many spoken words"
+
+    windows = _Windows()
+    monkeypatch.setattr(ab, "transcribe_reference", windows)
+    model = _omnivoice_stub()
+
+    prompt = _tts()._get_clone_prompt(model, _wav(tmp_path / "long.wav", 25), None)
+
+    assert prompt is not None
+    assert prompt.ref_text.startswith("this window has many spoken words")
+    assert model.audio_tokenizer.seen_samples <= 15 * SR
+    assert windows.calls == 2
+
+
+def test_window_cleanup_log_omits_the_absolute_path(
+    tmp_path, monkeypatch, no_prompt_disk_cache,
+):
+    import services.asr_backend as ab
+
+    tts = _tts()
+    monkeypatch.setattr(ab, "transcribe_reference", lambda _path: "spoken words here")
+    real_remove = os.remove
+
+    def _remove(path):
+        if not str(path).startswith(str(tmp_path)):
+            raise OSError("busy")
+        real_remove(path)
+
+    monkeypatch.setattr(os, "remove", _remove)
+    logged = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            logged.append(record)
+
+    handler = _Capture()
+    tts.logger.addHandler(handler)
+    previous = tts.logger.level
+    tts.logger.setLevel(logging.DEBUG)
+    try:
+        tts._get_clone_prompt(_omnivoice_stub(), _wav(tmp_path / "long.wav", 25), None)
+    finally:
+        tts.logger.setLevel(previous)
+        tts.logger.removeHandler(handler)
+
+    names = [
+        rec.args[0] for rec in logged
+        if rec.getMessage().startswith("failed to remove reference window")
+    ]
+    assert names
+    assert all(os.sep not in name and name == os.path.basename(name) for name in names)
 
 
 def test_generate_profile_with_typed_transcript_is_actionable(client, fake_engine, long_profile):

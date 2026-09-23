@@ -820,18 +820,170 @@ def omnivoice_ref_text(ref_audio, ref_text):
 # Keyed by the file version and the recognizer identity: a different model
 # must not reuse a passage it did not choose (#2281).
 _PASSAGE_CHOICE_MAX = 64
+# index < 0 means the clip was ranked and no installed recognizer produced words.
+_NO_PASSAGE = -1
 _passage_choices: "OrderedDict[tuple, tuple[int, str]]" = OrderedDict()
+# Env pins mirrored from the ASR backends. A model change must change this key
+# even when the backend id stays the same (#2281).
+_ASR_MODEL_PINS = {
+    "whisperx": ("ASR_MODEL_WHISPERX", "large-v3"),
+    "mlx-whisper": ("ASR_MODEL", "mlx-community/whisper-large-v3-mlx"),
+    "parakeet-mlx": ("ASR_MODEL_PARAKEET_MLX", "mlx-community/parakeet-tdt-0.6b-v3"),
+    "nemo-parakeet": ("ASR_MODEL_NEMO", "nvidia/parakeet-tdt-0.6b-v3"),
+    "moonshine": ("ASR_MODEL_MOONSHINE", "moonshine/base"),
+}
+
+
+def _recognizer_label(ab, backend: str) -> str:
+    """``backend:model`` for one configured recognizer, or "" when unnamed."""
+    if backend == "faster-whisper":
+        return "faster-whisper:" + ab.faster_whisper_model_id()
+    if backend == "faster-whisper-isolated":
+        pinned = os.environ.get("ASR_MODEL_FW") or ab.faster_whisper_model_id()
+        return "faster-whisper-isolated:" + pinned
+    if backend == "sherpa-onnx-asr":
+        return "sherpa-onnx-asr:" + ab.sherpa_engine_model_id()
+    if backend == "openai-compat-asr":
+        return "openai-compat-asr:" + ab.resolve_openai_compat_asr_model()
+    if backend == "funasr":
+        return "funasr:{model}:{vad}:{spk}".format(
+            model=os.environ.get("ASR_MODEL_FUNASR", "iic/SenseVoiceSmall"),
+            vad=os.environ.get("ASR_FUNASR_VAD", "fsmn-vad"),
+            spk=os.environ.get("ASR_FUNASR_SPK", "cam++"),
+        )
+    pin = _ASR_MODEL_PINS.get(backend)
+    if pin is None:
+        return ""
+    return backend + ":" + os.environ.get(pin[0], pin[1])
+
+
+def _capture_recognizer_label(ab) -> str:
+    """The dictation recognizer ``transcribe_reference`` may try second."""
+    sid = ab.dictation_model_id()
+    if sid:
+        ok, _reason = ab.SherpaDictationBackend.is_available()
+        if ok:
+            from services import sherpa_dictation as sd
+
+            spec = sd.get_spec(sid)
+            if spec is not None and not sd.is_demoted(spec.id):
+                return "sherpa-onnx-asr:" + spec.id
+    if ab._capture_prefers_parakeet():
+        model = os.environ.get(
+            "ASR_MODEL_PARAKEET_MLX", "mlx-community/parakeet-tdt-0.6b-v3",
+        )
+        return "parakeet-mlx:" + model
+    ok, _reason = ab.MLXWhisperBackend.is_available()
+    if ok:
+        return "mlx-whisper:" + ab._MLX_MODEL_TURBO
+    ok, _reason = ab.FasterWhisperBackend.is_available()
+    if ok:
+        return "faster-whisper:" + ab.faster_whisper_model_id()
+    model = os.environ.get(
+        "OMNIVOICE_PYTORCH_ASR_MODEL", "openai/whisper-large-v3-turbo",
+    )
+    return "pytorch-whisper:" + model
+
+
+def _fallback_recognizer_labels(ab, selected: list) -> Optional[list]:
+    """Installed fallbacks ``transcribe_reference`` tries after the selection.
+
+    ``None`` means the set could not be named. Callers then skip the passage
+    cache instead of reusing a window some other recognizer chose.
+    """
+    selected_fw = set()
+    selected_sherpa = set()
+    for part in selected:
+        kind, _, rest = part.partition(":")
+        if kind == "faster-whisper" and rest:
+            selected_fw.add(ab._fw_repo(rest) or rest)
+        elif kind == "sherpa-onnx-asr" and rest:
+            selected_sherpa.add(rest)
+    labels = []
+    try:
+        from api.routers.setup.models import (
+            KNOWN_MODELS, _model_supported, _snapshot_dirs, snapshot_is_complete,
+        )
+
+        available, _reason = ab.FasterWhisperBackend.is_available()
+        if available:
+            compatible = sorted(
+                (
+                    model for model in KNOWN_MODELS
+                    if str(model.get("role", "")).lower() == "asr"
+                    and not model.get("dictation_id")
+                    and (
+                        str(model.get("repo_id", "")).startswith("Systran/faster-")
+                        or model.get("repo_id")
+                        == "deepdml/faster-whisper-large-v3-turbo-ct2"
+                    )
+                    and _model_supported(model)
+                    and model.get("repo_id") not in selected_fw
+                ),
+                key=lambda model: float(model.get("size_gb") or 0),
+                reverse=True,
+            )
+            for model in compatible:
+                snapshots = [
+                    path for path in _snapshot_dirs(str(model["repo_id"]))
+                    if snapshot_is_complete(model, path)
+                ]
+                if snapshots:
+                    labels.append("faster-whisper:" + str(model["repo_id"]))
+                    break
+    except Exception:
+        logger.debug("reference ASR fallback identity unavailable", exc_info=True)
+        return None
+    try:
+        from services import sherpa_dictation
+
+        installed = sorted(
+            (
+                spec for spec in sherpa_dictation.list_specs()
+                if spec.id not in selected_sherpa
+                and sherpa_dictation.is_installed(spec)
+            ),
+            key=lambda spec: float(spec.size_gb or 0),
+            reverse=True,
+        )
+        if installed:
+            labels.append("sherpa-onnx-asr:" + installed[0].id)
+    except Exception:
+        logger.debug("reference dictation fallback identity unavailable", exc_info=True)
+        return None
+    return labels
 
 
 def _reference_asr_identity() -> str:
-    """The installed recognizer that ranks long-reference windows, if known."""
-    try:
-        from services.asr_backend import active_backend_id, faster_whisper_model_id
+    """Recognizers ``transcribe_reference`` would try, or "" when unnamed.
 
-        backend = active_backend_id()
-        if backend == "faster-whisper":
-            return backend + ":" + faster_whisper_model_id()
-        return backend
+    An empty result must not be used as a cache key: a later recognizer would
+    reuse a passage it did not choose. ``none`` is a real empty chain, so a
+    clip with no installed speech model is not ranked again until one appears.
+    """
+    try:
+        from services import asr_backend as ab
+
+        parts = []
+        if ab.asr_model_missing_error() is None:
+            backend = ab.active_backend_id()
+            # transcribe_reference skips the PyTorch pipeline on purpose.
+            if backend != "pytorch-whisper":
+                label = _recognizer_label(ab, backend)
+                if not label:
+                    return ""
+                parts.append(label)
+        if ab.asr_model_missing_error(purpose="dictation") is None:
+            capture = _capture_recognizer_label(ab)
+            if not capture:
+                return ""
+            if capture not in parts:
+                parts.append(capture)
+        fallbacks = _fallback_recognizer_labels(ab, parts)
+        if fallbacks is None:
+            return ""
+        parts.extend(fallbacks)
+        return "|".join(parts) if parts else "none"
     except Exception:
         logger.debug("reference ASR identity unavailable", exc_info=True)
         return ""
@@ -847,6 +999,8 @@ def _passage_choice_key(ref_audio: str) -> tuple:
 
 
 def _recall_passage(ref_audio: str) -> Optional[tuple[int, str]]:
+    if not _reference_asr_identity():
+        return None
     key = _passage_choice_key(ref_audio)
     with _prompt_cache_lock:
         hit = _passage_choices.get(key)
@@ -857,12 +1011,52 @@ def _recall_passage(ref_audio: str) -> Optional[tuple[int, str]]:
 
 
 def _remember_passage(ref_audio: str, index: int, text: str) -> None:
+    if not _reference_asr_identity():
+        return
     key = _passage_choice_key(ref_audio)
     with _prompt_cache_lock:
         _passage_choices[key] = (index, text)
         _passage_choices.move_to_end(key)
         while len(_passage_choices) > _PASSAGE_CHOICE_MAX:
             _passage_choices.popitem(last=False)
+
+
+def _read_reference_mono(path: str):
+    """Float32 mono samples and sample rate, or None.
+
+    libsndfile first, then pydub/ffmpeg. Same pair as ``reference_duration_s``
+    and OmniVoice's loader, so an M4A or AAC reference can still be windowed.
+    """
+    audio = None
+    sr = 0
+    try:
+        import soundfile as sf
+
+        audio, sr = sf.read(path, dtype="float32", always_2d=False)
+        sr = int(sr)
+    except Exception:
+        audio = None
+    if audio is None:
+        try:
+            import numpy as np
+            from pydub import AudioSegment
+
+            segment = AudioSegment.from_file(path)
+            sr = int(segment.frame_rate)
+            samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
+            if segment.sample_width:
+                samples /= float(1 << (8 * segment.sample_width - 1))
+            if segment.channels > 1:
+                samples = samples.reshape(-1, segment.channels).mean(axis=1)
+            audio = samples
+        except Exception:
+            logger.debug("long-reference decode failed", exc_info=True)
+            return None
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    if sr <= 0 or len(audio) == 0:
+        return None
+    return audio, sr
 
 
 def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
@@ -873,27 +1067,23 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
     last resort and is never downloaded; this uses the speech-to-text model
     already selected in Model Catalogue (#2281). Returns ``(wav_path,
     transcript)`` or None when no installed recognizer produced words. The
-    caller deletes ``wav_path``.
+    caller deletes ``wav_path``. A decoded clip with no spoken words is
+    remembered so the next chunk does not rank it again.
     """
     from omnivoice.utils.audio import CLONE_REF_MAX_WINDOWS, CLONE_REF_WINDOW_SECONDS
 
+    loaded = _read_reference_mono(ref_audio)
+    if loaded is None:
+        return None
+    audio, sr = loaded
+    window = int(CLONE_REF_WINDOW_SECONDS * sr)
+    if window <= 0 or len(audio) <= window:
+        return None
+    if len(audio) > window * CLONE_REF_MAX_WINDOWS:
+        _remember_passage(ref_audio, _NO_PASSAGE, "")
+        return None
     try:
         import soundfile as sf
-
-        info = sf.info(ref_audio)
-        sr = int(info.samplerate)
-        window = int(CLONE_REF_WINDOW_SECONDS * sr)
-        if window <= 0 or info.frames <= window:
-            return None
-        if info.frames > window * CLONE_REF_MAX_WINDOWS:
-            return None
-        audio, sr = sf.read(ref_audio, dtype="float32", always_2d=False)
-    except Exception:
-        logger.debug("long-reference passage split failed", exc_info=True)
-        return None
-    if getattr(audio, "ndim", 1) > 1:
-        audio = audio.mean(axis=1)
-    try:
         from services.asr_backend import transcribe_reference
     except Exception:
         logger.debug("installed reference ASR import failed", exc_info=True)
@@ -940,6 +1130,7 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
             except OSError:
                 pass
     if best_path is None:
+        _remember_passage(ref_audio, _NO_PASSAGE, "")
         return None
     _remember_passage(ref_audio, best_index, best_text)
     return best_path, best_text
@@ -949,21 +1140,17 @@ def _materialize_window(ref_audio: str, index: int) -> Optional[str]:
     """Write one previously chosen 15 s window. The caller deletes the file."""
     from omnivoice.utils.audio import CLONE_REF_WINDOW_SECONDS
 
-    try:
-        import soundfile as sf
-
-        audio, sr = sf.read(ref_audio, dtype="float32", always_2d=False)
-    except Exception:
-        logger.debug("long-reference window rewrite failed", exc_info=True)
+    loaded = _read_reference_mono(ref_audio)
+    if loaded is None or index < 0:
         return None
-    if getattr(audio, "ndim", 1) > 1:
-        audio = audio.mean(axis=1)
+    audio, sr = loaded
     window = int(CLONE_REF_WINDOW_SECONDS * sr)
     if window <= 0:
         return None
     chunk = audio[index * window:(index + 1) * window]
     if len(chunk) == 0:
         return None
+    import soundfile as sf
     import tempfile
 
     fd, path = tempfile.mkstemp(suffix=".wav")
@@ -978,6 +1165,23 @@ def _materialize_window(ref_audio: str, index: int) -> Optional[str]:
             pass
         return None
     return path
+
+
+def _reuse_or_rank_passage(ref_audio: str) -> Optional[tuple[str, str]]:
+    """Return the cached 15 s window, or rank one and remember the result.
+
+    A remembered miss (no spoken words, or a clip past five windows) is not
+    ranked again. The caller deletes the wav path.
+    """
+    if _reference_asr_identity():
+        recalled = _recall_passage(ref_audio)
+        if recalled is not None:
+            if recalled[0] < 0:
+                return None
+            path = _materialize_window(ref_audio, recalled[0])
+            if path is not None:
+                return path, recalled[1]
+    return _omnivoice_installed_passage(ref_audio)
 
 
 def _speech_score(text: str) -> int:
@@ -1023,13 +1227,9 @@ def _get_clone_prompt(
             # with the recognizer's identity. The model's Whisper snapshot
             # remains the fallback and is never downloaded.
             ref_text = omnivoice_ref_text(ref_audio, ref_text)
-            recalled = _recall_passage(ref_audio)
-            if recalled is not None:
-                ref_text = recalled[1]
-            else:
-                selected = _omnivoice_installed_passage(ref_audio)
-                if selected is not None:
-                    passage_file, ref_text = selected
+            selected = _reuse_or_rank_passage(ref_audio)
+            if selected is not None:
+                passage_file, ref_text = selected
         elif ref_audio and not ref_text:
             try:
                 unresolved_key = _clone_prompt_key(
@@ -1062,17 +1262,6 @@ def _get_clone_prompt(
         encode_text = ref_text
         if passage_file is not None:
             encode_audio = passage_file
-        elif (
-            prompt is None
-            and duration is not None
-            and duration > CLONE_REF_TEXT_MAX_SECONDS
-        ):
-            recalled = _recall_passage(ref_audio)
-            if recalled is not None:
-                passage_file = _materialize_window(ref_audio, recalled[0])
-                if passage_file is not None:
-                    encode_audio = passage_file
-                    encode_text = recalled[1]
         if prompt is None:
             try:
                 # Encode outside the lock (slow). Mirrors exactly what generate()
@@ -1134,7 +1323,10 @@ def _get_clone_prompt(
             try:
                 os.remove(passage_file)
             except OSError:
-                logger.debug("failed to remove reference window %s", passage_file)
+                logger.debug(
+                    "failed to remove reference window %s",
+                    os.path.basename(passage_file),
+                )
 
 
 def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
