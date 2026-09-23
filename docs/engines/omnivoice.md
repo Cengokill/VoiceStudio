@@ -73,7 +73,8 @@ The env var overrides the persisted UI choice.
   a fallback when no catalogue recognizer can transcribe a window, and it is
   never downloaded during cloning. A transcript typed on the request for
   such a clip is rejected with `[clone_ref_too_long]`.
-  Longer clips must be trimmed first. If no spoken words are detected, trim to
+  Only that 15-second window is sent to the model. Clips longer than 75 seconds
+  must be trimmed first. If no spoken words are detected, trim to
   a clear 3–10 second passage or provide its matching transcript.
 - For cross-language cloning, keep the reference transcript in the sample's
   original language and write the new script in the desired output language.

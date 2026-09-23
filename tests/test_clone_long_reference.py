@@ -120,6 +120,58 @@ def test_long_reference_uses_installed_asr_windows(
     assert original not in windows.paths
     assert len(windows.paths) == 2
 
+    again = _tts()._get_clone_prompt(model, original, "stored whole clip transcript")
+    assert again is prompt
+    assert len(windows.paths) == 2
+
+
+def test_long_reference_over_75s_is_not_windowed(
+    tmp_path, monkeypatch, no_prompt_disk_cache
+):
+    """Past the engine's hard cap, no catalogue window is invented."""
+    import services.asr_backend as ab
+
+    counting = _CountingTranscribe(result="should not run")
+    monkeypatch.setattr(ab, "transcribe_reference", counting)
+    model = _omnivoice_stub()
+
+    prompt = _tts()._get_clone_prompt(model, _wav(tmp_path / "too-long.wav", 80), None)
+
+    assert prompt is None
+    assert counting.calls == 0
+
+
+def test_changed_recognizer_does_not_reuse_the_cached_passage(
+    tmp_path, monkeypatch, no_prompt_disk_cache
+):
+    """The prompt cache is keyed by the recognizer that picked the window."""
+    import services.asr_backend as ab
+
+    class _Windows:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _path):
+            self.calls += 1
+            if self.calls <= 2:
+                return "hi" if self.calls == 1 else "this window has many spoken words"
+            return "a completely different spoken passage"
+
+    windows = _Windows()
+    monkeypatch.setattr(ab, "transcribe_reference", windows)
+    identity = {"value": "recognizer-a"}
+    monkeypatch.setattr(_tts(), "_reference_asr_identity", lambda: identity["value"])
+    model = _omnivoice_stub()
+    original = _wav(tmp_path / "long.wav", 25)
+
+    first = _tts()._get_clone_prompt(model, original, None)
+    identity["value"] = "recognizer-b"
+    second = _tts()._get_clone_prompt(model, original, None)
+
+    assert first.ref_text.startswith("this window has many spoken words")
+    assert second.ref_text.startswith("a completely different spoken passage")
+    assert windows.calls == 4
+
 
 def test_long_reference_without_installed_asr_uses_model_passage(
     tmp_path, monkeypatch, no_prompt_disk_cache

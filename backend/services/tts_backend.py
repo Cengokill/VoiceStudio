@@ -792,9 +792,9 @@ def omnivoice_ref_text(ref_audio, ref_text):
     overwhelmingly machine-made: the profile save and Voice Clone both
     transcribe the whole clip automatically, and a stored profile keeps that
     transcript forever. Passing one on made every saved voice longer than 20 s
-    permanently unusable on the default engine. Dropping it routes the clip
-    through the model's own best-passage selection, which transcribes the
-    chosen passage itself. A transcript typed on a ``/generate`` request is
+    permanently unusable on the default engine. Dropping it lets the installed
+    recognizer rank 15 s windows; the model's own Whisper snapshot is only the
+    fallback when that recognizer finds no words. A transcript typed on a ``/generate`` request is
     rejected there with ``[clone_ref_too_long]`` before reaching this point.
     """
     if not ref_text or not ref_text.strip():
@@ -810,10 +810,56 @@ def omnivoice_ref_text(ref_audio, ref_text):
         return ref_text
     logger.info(
         "reference is %.1fs (>%.0fs): ignoring its whole-clip transcript so "
-        "OmniVoice picks and transcribes the best passage",
+        "the best 15s passage can be selected",
         duration, CLONE_REF_TEXT_MAX_SECONDS,
     )
     return None
+
+
+# Which 15 s window an installed recognizer picked for a long reference.
+# Keyed by the file version and the recognizer identity: a different model
+# must not reuse a passage it did not choose (#2281).
+_PASSAGE_CHOICE_MAX = 64
+_passage_choices: "OrderedDict[tuple, tuple[int, str]]" = OrderedDict()
+
+
+def _reference_asr_identity() -> str:
+    """The installed recognizer that ranks long-reference windows, if known."""
+    try:
+        from services.asr_backend import active_backend_id, faster_whisper_model_id
+
+        backend = active_backend_id()
+        if backend == "faster-whisper":
+            return backend + ":" + faster_whisper_model_id()
+        return backend
+    except Exception:
+        logger.debug("reference ASR identity unavailable", exc_info=True)
+        return ""
+
+
+def _passage_choice_key(ref_audio: str) -> tuple:
+    try:
+        st = os.stat(ref_audio)
+        version = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        version = (0, 0)
+    return (os.path.abspath(ref_audio), version, _reference_asr_identity())
+
+
+def _recall_passage(ref_audio: str) -> Optional[tuple[int, str]]:
+    hit = _passage_choices.get(_passage_choice_key(ref_audio))
+    if hit is None:
+        return None
+    _passage_choices.move_to_end(_passage_choice_key(ref_audio))
+    return hit
+
+
+def _remember_passage(ref_audio: str, index: int, text: str) -> None:
+    key = _passage_choice_key(ref_audio)
+    _passage_choices[key] = (index, text)
+    _passage_choices.move_to_end(key)
+    while len(_passage_choices) > _PASSAGE_CHOICE_MAX:
+        _passage_choices.popitem(last=False)
 
 
 def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
@@ -856,6 +902,7 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
     best_activity = -1.0
     best_path: Optional[str] = None
     best_text = ""
+    best_index = 0
     n_windows = min(CLONE_REF_MAX_WINDOWS, (len(audio) + window - 1) // window)
     for index in range(n_windows):
         chunk = audio[index * window:(index + 1) * window]
@@ -883,6 +930,7 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
             best_activity = activity
             best_path = path
             best_text = text
+            best_index = index
         else:
             try:
                 os.remove(path)
@@ -890,7 +938,43 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
                 pass
     if best_path is None:
         return None
+    _remember_passage(ref_audio, best_index, best_text)
     return best_path, best_text
+
+
+def _materialize_window(ref_audio: str, index: int) -> Optional[str]:
+    """Write one previously chosen 15 s window. The caller deletes the file."""
+    from omnivoice.utils.audio import CLONE_REF_WINDOW_SECONDS
+
+    try:
+        import soundfile as sf
+
+        audio, sr = sf.read(ref_audio, dtype="float32", always_2d=False)
+    except Exception:
+        logger.debug("long-reference window rewrite failed", exc_info=True)
+        return None
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    window = int(CLONE_REF_WINDOW_SECONDS * sr)
+    if window <= 0:
+        return None
+    chunk = audio[index * window:(index + 1) * window]
+    if len(chunk) == 0:
+        return None
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        sf.write(path, chunk, sr)
+    except Exception:
+        logger.debug("long-reference window write failed", exc_info=True)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return path
 
 
 def _speech_score(text: str) -> int:
@@ -928,54 +1012,64 @@ def _get_clone_prompt(
     from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
 
     duration = reference_duration_s(ref_audio)
-    if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
-        # #2281: a whole-clip transcript cannot be aligned — neither a stored
-        # one nor one resolved here. Leave it to the model's passage selection.
-        ref_text = omnivoice_ref_text(ref_audio, ref_text)
-    elif ref_audio and not ref_text:
-        try:
-            unresolved_key = _clone_prompt_key(
-                ref_audio, None, preprocess_prompt
-            )
-        except Exception:
-            pass
-        try:
-            from services.asr_backend import transcribe_reference
-
-            ref_text = transcribe_reference(ref_audio)
-        except Exception as e:  # noqa: BLE001 — model fallback remains available
-            logger.warning("reference transcript resolution failed: %s", e)
-        if ref_text and unresolved_key is not None:
-            _prompt_cache_evict(unresolved_key)
-
-    try:
-        key = _clone_prompt_key(ref_audio, ref_text, preprocess_prompt)
-    except Exception:
-        return None
-    with _prompt_cache_lock:
-        hit = _prompt_cache.get(key)
-        if hit is not None:
-            _prompt_cache.move_to_end(key)
-            return hit
-    # Memory miss → disk (survives restarts). A disk hit skips the encode AND
-    # the ASR transcription pass a ref_text-less reference would trigger.
-    prompt = _prompt_disk_load(key)
-    encode_audio = ref_audio
-    encode_text = ref_text
     passage_file = None
-    if (
-        prompt is None
-        and duration is not None
-        and duration > CLONE_REF_TEXT_MAX_SECONDS
-    ):
-        # Rank 15 s windows with the installed recognizer and encode only the
-        # winner, so a missing OmniVoice Whisper snapshot cannot block a clip
-        # the catalogue can already transcribe.
-        selected = _omnivoice_installed_passage(ref_audio)
-        if selected is not None:
-            passage_file, encode_text = selected
-            encode_audio = passage_file
     try:
+        if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
+            # #2281: a whole-clip transcript cannot be aligned. Rank 15 s
+            # windows with the installed recognizer and cache that choice
+            # with the recognizer's identity. The model's Whisper snapshot
+            # remains the fallback and is never downloaded.
+            ref_text = omnivoice_ref_text(ref_audio, ref_text)
+            recalled = _recall_passage(ref_audio)
+            if recalled is not None:
+                ref_text = recalled[1]
+            else:
+                selected = _omnivoice_installed_passage(ref_audio)
+                if selected is not None:
+                    passage_file, ref_text = selected
+        elif ref_audio and not ref_text:
+            try:
+                unresolved_key = _clone_prompt_key(
+                    ref_audio, None, preprocess_prompt
+                )
+            except Exception:
+                pass
+            try:
+                from services.asr_backend import transcribe_reference
+
+                ref_text = transcribe_reference(ref_audio)
+            except Exception as e:  # noqa: BLE001 — model fallback remains available
+                logger.warning("reference transcript resolution failed: %s", e)
+            if ref_text and unresolved_key is not None:
+                _prompt_cache_evict(unresolved_key)
+
+        try:
+            key = _clone_prompt_key(ref_audio, ref_text, preprocess_prompt)
+        except Exception:
+            return None
+        with _prompt_cache_lock:
+            hit = _prompt_cache.get(key)
+            if hit is not None:
+                _prompt_cache.move_to_end(key)
+                return hit
+        # Memory miss → disk (survives restarts). A disk hit skips the encode AND
+        # the ASR transcription pass a ref_text-less reference would trigger.
+        prompt = _prompt_disk_load(key)
+        encode_audio = ref_audio
+        encode_text = ref_text
+        if passage_file is not None:
+            encode_audio = passage_file
+        elif (
+            prompt is None
+            and duration is not None
+            and duration > CLONE_REF_TEXT_MAX_SECONDS
+        ):
+            recalled = _recall_passage(ref_audio)
+            if recalled is not None:
+                passage_file = _materialize_window(ref_audio, recalled[0])
+                if passage_file is not None:
+                    encode_audio = passage_file
+                    encode_text = recalled[1]
         if prompt is None:
             try:
                 # Encode outside the lock (slow). Mirrors exactly what generate()
@@ -1087,6 +1181,7 @@ def clear_clone_prompt_cache() -> None:
     unload so a flush/engine-switch doesn't strand VRAM."""
     with _prompt_cache_lock:
         _prompt_cache.clear()
+    _passage_choices.clear()
 
 
 # NB: model_manager.release_tts_side_caches() calls clear_clone_prompt_cache()

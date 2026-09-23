@@ -10,7 +10,7 @@ metadata and the backend fallback mirror it. Archived Tauri manifests stay froze
 
 **Highlights**
 
-- Long voice references clone with the speech model you already installed (#2281)
+- A reference longer than 20 s clones from its best 15 s window using the speech model already installed (#2281)
 
 ### Fixed
 
