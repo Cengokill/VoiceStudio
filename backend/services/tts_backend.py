@@ -847,19 +847,22 @@ def _passage_choice_key(ref_audio: str) -> tuple:
 
 
 def _recall_passage(ref_audio: str) -> Optional[tuple[int, str]]:
-    hit = _passage_choices.get(_passage_choice_key(ref_audio))
-    if hit is None:
-        return None
-    _passage_choices.move_to_end(_passage_choice_key(ref_audio))
-    return hit
+    key = _passage_choice_key(ref_audio)
+    with _prompt_cache_lock:
+        hit = _passage_choices.get(key)
+        if hit is None:
+            return None
+        _passage_choices.move_to_end(key)
+        return hit
 
 
 def _remember_passage(ref_audio: str, index: int, text: str) -> None:
     key = _passage_choice_key(ref_audio)
-    _passage_choices[key] = (index, text)
-    _passage_choices.move_to_end(key)
-    while len(_passage_choices) > _PASSAGE_CHOICE_MAX:
-        _passage_choices.popitem(last=False)
+    with _prompt_cache_lock:
+        _passage_choices[key] = (index, text)
+        _passage_choices.move_to_end(key)
+        while len(_passage_choices) > _PASSAGE_CHOICE_MAX:
+            _passage_choices.popitem(last=False)
 
 
 def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
@@ -1181,7 +1184,7 @@ def clear_clone_prompt_cache() -> None:
     unload so a flush/engine-switch doesn't strand VRAM."""
     with _prompt_cache_lock:
         _prompt_cache.clear()
-    _passage_choices.clear()
+        _passage_choices.clear()
 
 
 # NB: model_manager.release_tts_side_caches() calls clear_clone_prompt_cache()

@@ -21,6 +21,7 @@ Rules pinned here:
 """
 import importlib
 import os
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -518,6 +519,51 @@ def long_profile():
         conn.execute("DELETE FROM generation_history WHERE profile_id=?", (pid,))
         conn.execute("DELETE FROM voice_profiles WHERE id=?", (pid,))
     os.remove(clip)
+
+
+def test_passage_choices_share_the_prompt_cache_lock(tmp_path, no_prompt_disk_cache):
+    """Two GPU workers can rank long references at once; the window LRU must
+    take the same lock as the prompt cache."""
+    tts = _tts()
+    held = []
+
+    class _Guarded(OrderedDict):
+        def _check(self):
+            held.append(tts._prompt_cache_lock.locked())
+
+        def get(self, key, default=None):
+            self._check()
+            return super().get(key, default)
+
+        def __setitem__(self, key, value):
+            self._check()
+            super().__setitem__(key, value)
+
+        def move_to_end(self, key, last=True):
+            self._check()
+            return super().move_to_end(key, last)
+
+        def popitem(self, last=True):
+            self._check()
+            return super().popitem(last)
+
+        def clear(self):
+            self._check()
+            super().clear()
+
+    original = tts._passage_choices
+    guarded = _Guarded()
+    tts._passage_choices = guarded
+    try:
+        first = _wav(tmp_path / "first.wav", 1)
+        tts._remember_passage(first, 1, "first window")
+        assert tts._recall_passage(first) == (1, "first window")
+        for index in range(tts._PASSAGE_CHOICE_MAX):
+            tts._remember_passage(_wav(tmp_path / f"w{index}.wav", 1), 0, "x")
+        tts.clear_clone_prompt_cache()
+    finally:
+        tts._passage_choices = original
+    assert held and all(held)
 
 
 def test_generate_profile_with_typed_transcript_is_actionable(client, fake_engine, long_profile):
