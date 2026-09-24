@@ -186,19 +186,18 @@ def test_equal_transcripts_from_different_windows_do_not_share_prompt(
     """Conditioning must follow the window, not just the recognized words."""
     import services.asr_backend as ab
 
-    identity = {"value": "a"}
     calls = {"value": 0}
-    monkeypatch.setattr(_tts(), "_reference_asr_identity", lambda: identity["value"])
+    monkeypatch.setattr(_tts(), "_reference_asr_identity", lambda: "same-recognizer")
 
     def transcribe(_path):
         calls["value"] += 1
-        return "same words" if (calls["value"] % 2 == 1) == (identity["value"] == "a") else ""
+        return "same words" if calls["value"] in (1, 4) else ""
 
     monkeypatch.setattr(ab, "transcribe_reference", transcribe)
     original = _wav(tmp_path / "long.wav", 25)
     model = _omnivoice_stub()
     first = _tts()._get_clone_prompt(model, original, None)
-    identity["value"] = "b"
+    _tts()._passage_choices.clear()
     second = _tts()._get_clone_prompt(model, original, None)
 
     assert first is not None and second is not None
