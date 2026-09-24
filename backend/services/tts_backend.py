@@ -738,17 +738,15 @@ def _prompt_disk_save(key: tuple, prompt) -> None:
         logger.debug("prompt disk cache prune skipped: %s", e)
 
 
-def _clone_prompt_key(ref_audio: str, ref_text, preprocess_prompt: bool = True):
+def _clone_prompt_key(ref_audio: str, ref_text, preprocess_prompt: bool = True, *, passage=None):
     try:
         mtime = os.path.getmtime(ref_audio)
     except OSError:
         mtime = 0.0
-    # preprocess_prompt is part of the key: it changes the encoded prompt
-    # (silence removal + trimming + ref-text punctuation, omnivoice.py:675/722),
-    # so a False request must not be served a True-encoded prompt — or poison
-    # the cache for the True callers. /generate never sets it (always the True
-    # default); /v1/audio/speech exposes it.
-    return (os.path.abspath(ref_audio), mtime, ref_text or "", bool(preprocess_prompt))
+    # The selected passage changes conditioning even if two windows have the
+    # same transcript. Keep short-reference keys unchanged.
+    key = (os.path.abspath(ref_audio), mtime, ref_text or "", bool(preprocess_prompt))
+    return key if passage is None else (*key, passage)
 
 
 def reference_duration_s(path) -> Optional[float]:
@@ -1220,16 +1218,30 @@ def _get_clone_prompt(
 
     duration = reference_duration_s(ref_audio)
     passage_file = None
+    passage_context = None
+    recalled_index = None
+    cacheable = True
     try:
         if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
-            # #2281: a whole-clip transcript cannot be aligned. Rank 15 s
-            # windows with the installed recognizer and cache that choice
-            # with the recognizer's identity. The model's Whisper snapshot
-            # remains the fallback and is never downloaded.
+            # A recalled passage has enough information to check both caches
+            # before decoding the full recording and writing another WAV.
             ref_text = omnivoice_ref_text(ref_audio, ref_text)
-            selected = _reuse_or_rank_passage(ref_audio)
-            if selected is not None:
-                passage_file, ref_text = selected
+            identity = _reference_asr_identity()
+            recalled = _recall_passage(ref_audio) if identity else None
+            if recalled is not None and recalled[0] >= 0:
+                recalled_index, ref_text = recalled
+            elif recalled is None:
+                selected = _reuse_or_rank_passage(ref_audio)
+                if selected is not None:
+                    passage_file, ref_text = selected
+                    recalled = _recall_passage(ref_audio) if identity else None
+                    if recalled is not None:
+                        recalled_index = recalled[0]
+            if not identity:
+                # The selected recognizer is unknown; a reusable prompt could
+                # belong to another window with exactly the same transcript.
+                cacheable = False
+            passage_context = (identity, recalled_index)
         elif ref_audio and not ref_text:
             try:
                 unresolved_key = _clone_prompt_key(
@@ -1247,17 +1259,21 @@ def _get_clone_prompt(
                 _prompt_cache_evict(unresolved_key)
 
         try:
-            key = _clone_prompt_key(ref_audio, ref_text, preprocess_prompt)
+            key = _clone_prompt_key(
+                ref_audio, ref_text, preprocess_prompt, passage=passage_context
+            )
         except Exception:
             return None
-        with _prompt_cache_lock:
-            hit = _prompt_cache.get(key)
-            if hit is not None:
-                _prompt_cache.move_to_end(key)
-                return hit
-        # Memory miss → disk (survives restarts). A disk hit skips the encode AND
-        # the ASR transcription pass a ref_text-less reference would trigger.
-        prompt = _prompt_disk_load(key)
+        if cacheable:
+            with _prompt_cache_lock:
+                hit = _prompt_cache.get(key)
+                if hit is not None:
+                    _prompt_cache.move_to_end(key)
+                    return hit
+        # A recalled passage is materialized only when neither cache hits.
+        prompt = _prompt_disk_load(key) if cacheable else None
+        if prompt is None and recalled_index is not None:
+            passage_file = _materialize_window(ref_audio, recalled_index)
         encode_audio = ref_audio
         encode_text = ref_text
         if passage_file is not None:
@@ -1308,9 +1324,9 @@ def _get_clone_prompt(
                         "voice-clone prompt precompute failed; using inline ref: %s", e
                     )
                     return None
-            if store:
+            if store and cacheable:
                 _prompt_disk_save(key, prompt)
-        if not store:
+        if not store or not cacheable:
             return prompt
         with _prompt_cache_lock:
             _prompt_cache[key] = prompt

@@ -86,9 +86,11 @@ The env var overrides the persisted UI choice.
   default for existing API clients. Engine language coverage and accent quality
   still vary; use a multilingual engine that supports the target language.
 - Encoded voice references persist on disk (`prompt_cache/` in the app data
-  dir), so the first generation with a known voice after a restart skips the
-  re-encode and any transcription pass. Set `OMNIVOICE_PROMPT_DISK_CACHE=0`
-  to keep the cache in memory only.
+  dir), so known short references skip re-encoding and transcription after a
+  restart. Long references must rank windows once after a restart to recover
+  the selected transcript; subsequent generations reuse the chosen passage
+  and cached prompt without re-decoding the clip. Set
+  `OMNIVOICE_PROMPT_DISK_CACHE=0` to keep the prompt cache in memory only.
 - Style attributes (`instruct`) and a reference clip can be **combined**:
   when they agree, the instruct stabilizes cloning for the attributes it
   names (upstream documents dialect cloning as the canonical case — dialect

@@ -105,6 +105,7 @@ def test_long_reference_uses_installed_asr_windows(
 
     windows = _Windows()
     monkeypatch.setattr(ab, "transcribe_reference", windows)
+    monkeypatch.setattr(_tts(), "_reference_asr_identity", lambda: "fixed-recognizer")
     monkeypatch.setattr(
         OmniVoice,
         "_load_cached_reference_asr",
@@ -121,6 +122,10 @@ def test_long_reference_uses_installed_asr_windows(
     assert model.audio_tokenizer.seen_samples <= 15 * SR
     assert original not in windows.paths
     assert len(windows.paths) == 2
+    monkeypatch.setattr(
+        _tts(), "_materialize_window",
+        lambda *_: (_ for _ in ()).throw(AssertionError("cache hit decoded reference")),
+    )
 
     again = _tts()._get_clone_prompt(model, original, "stored whole clip transcript")
     assert again is prompt
@@ -173,6 +178,33 @@ def test_changed_recognizer_does_not_reuse_the_cached_passage(
     assert first.ref_text.startswith("this window has many spoken words")
     assert second.ref_text.startswith("a completely different spoken passage")
     assert windows.calls == 4
+
+
+def test_equal_transcripts_from_different_windows_do_not_share_prompt(
+    tmp_path, monkeypatch, no_prompt_disk_cache
+):
+    """Conditioning must follow the window, not just the recognized words."""
+    import services.asr_backend as ab
+
+    identity = {"value": "a"}
+    calls = {"value": 0}
+    monkeypatch.setattr(_tts(), "_reference_asr_identity", lambda: identity["value"])
+
+    def transcribe(_path):
+        calls["value"] += 1
+        return "same words" if (calls["value"] % 2 == 1) == (identity["value"] == "a") else ""
+
+    monkeypatch.setattr(ab, "transcribe_reference", transcribe)
+    original = _wav(tmp_path / "long.wav", 25)
+    model = _omnivoice_stub()
+    first = _tts()._get_clone_prompt(model, original, None)
+    identity["value"] = "b"
+    second = _tts()._get_clone_prompt(model, original, None)
+
+    assert first is not None and second is not None
+    assert first is not second
+    assert first.ref_text == second.ref_text
+    assert calls["value"] == 4
 
 
 def test_long_reference_without_installed_asr_uses_model_passage(
