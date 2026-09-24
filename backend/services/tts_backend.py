@@ -930,7 +930,7 @@ def _fallback_recognizer_labels(ab, selected: list) -> Optional[list]:
                     labels.append("faster-whisper:" + str(model["repo_id"]))
                     break
     except Exception:
-        logger.debug("reference ASR fallback identity unavailable", exc_info=True)
+        logger.debug("reference ASR fallback identity unavailable")
         return None
     try:
         from services import sherpa_dictation
@@ -947,7 +947,7 @@ def _fallback_recognizer_labels(ab, selected: list) -> Optional[list]:
         if installed:
             labels.append("sherpa-onnx-asr:" + installed[0].id)
     except Exception:
-        logger.debug("reference dictation fallback identity unavailable", exc_info=True)
+        logger.debug("reference dictation fallback identity unavailable")
         return None
     return labels
 
@@ -983,7 +983,7 @@ def _reference_asr_identity() -> str:
         parts.extend(fallbacks)
         return "|".join(parts) if parts else "none"
     except Exception:
-        logger.debug("reference ASR identity unavailable", exc_info=True)
+        logger.debug("reference ASR identity unavailable")
         return ""
 
 
@@ -1048,7 +1048,7 @@ def _read_reference_mono(path: str):
                 samples = samples.reshape(-1, segment.channels).mean(axis=1)
             audio = samples
         except Exception:
-            logger.debug("long-reference decode failed", exc_info=True)
+            logger.debug("long-reference decode failed")
             return None
     if getattr(audio, "ndim", 1) > 1:
         audio = audio.mean(axis=1)
@@ -1084,7 +1084,7 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
         import soundfile as sf
         from services.asr_backend import transcribe_reference
     except Exception:
-        logger.debug("installed reference ASR import failed", exc_info=True)
+        logger.debug("installed reference ASR import failed")
         return None
 
     import tempfile
@@ -1105,7 +1105,7 @@ def _omnivoice_installed_passage(ref_audio: str) -> Optional[tuple[str, str]]:
             sf.write(path, chunk, sr)
             text = (transcribe_reference(path) or "").strip()
         except Exception:
-            logger.warning("window transcription failed", exc_info=True)
+            logger.warning("window transcription failed")
             text = ""
         score = _speech_score(text)
         activity = float((chunk.astype("float64") ** 2).sum()) if score else 0.0
@@ -1156,7 +1156,7 @@ def _materialize_window(ref_audio: str, index: int) -> Optional[str]:
     try:
         sf.write(path, chunk, sr)
     except Exception:
-        logger.debug("long-reference window write failed", exc_info=True)
+        logger.debug("long-reference window write failed")
         try:
             os.remove(path)
         except OSError:
